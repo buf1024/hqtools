@@ -1,6 +1,6 @@
 from functools import wraps
 from collections import namedtuple
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union, Callable
 import motor.motor_asyncio
 from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect
 import time
@@ -17,7 +17,7 @@ nest_asyncio.apply()
 class MongoDB():
     _MongoStat = namedtuple('_MongoStat', ['client', 'count', 'last'])
 
-    def __init__(self, *, meta: Dict = dict(),  uri: str = 'mongodb://localhost:27017/', db: str = 'winq',  pool: int = 5):
+    def __init__(self, *, meta: Dict = None,  uri: str = 'mongodb://localhost:27017/', db: str = 'amz',  pool: int = 5):
         """MongoDB访问类，可以继承方便使用，不想继承时，创数据库的meta即可。
 
         meta的格式为，比如有一张表 abc: {a: 1, b: '1'}, 则meta={'abc': {'a': '字段a的含义', 'b': '字段b的含义'}}
@@ -42,6 +42,8 @@ class MongoDB():
 
         self.is_init = False
 
+        self.is_init = self.init()
+
     def _best_client(func):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
@@ -64,36 +66,53 @@ class MongoDB():
         elif attr.startswith('save_'):
             tab, func = attr[len('save_'):], self._base_save
         else:
-            if attr not in self.meta.keys():
-                raise Exception('Invalid property')
+            # if attr not in self.meta.keys():
+            #     raise Exception('invalid property')
 
-            return self.get_coll(self.db, attr)
+            return self._get_coll(self.db, attr)
 
-        if tab is None or tab not in self.meta.keys():
-            raise Exception('Invalid mongodb function!')
+        # if tab is None or tab not in self.meta.keys():
+        #     raise Exception('invalid mongodb function!')
+        if tab is None:
+            raise Exception('invalid mongodb function!')
 
-        coll = self.get_coll(self.db, tab)
+        coll = self._get_coll(self.db, tab)
 
         return partial(func, attr=attr, coll=coll)
 
-    async def _base_load(self, *, attr, coll, **kwargs) -> Optional[pd.DataFrame]:
+    async def _base_load(self, *, attr: str, coll: str, **kwargs) -> Optional[Union[pd.DataFrame, Dict]]:
+        """内部函数，不用管
+
+        Args:
+            attr (str): 原始是修饰器传的值
+            coll (str): 原始是修饰器解析出来的表
+            kwargs参数同pymongo参数, 另外增加to_frame, 
+            如filter=None, projection=None, skip=0, limit=0, sort=None, to_frame=True
+
+        Returns:
+            Optional[pd.DataFrame]: DataFrame/Dict
         """
-        kwargs参数同pymongo参数, 另外增加to_frame
-        :param kwargs:  filter=None, projection=None, skip=0, limit=0, sort=None, to_frame=True
-        :return: DataFrame
-        """
+
         self.log.debug('加载: {}, kwargs={} ...'.format(attr, kwargs))
-        df = await self.do_load(coll, **kwargs)
+        df = await self.do_load(coll=coll, **kwargs)
         self.log.debug('加载: {} 成功 size={}'.format(
-            attr, df.shape[0] if df is not None else 0))
+            attr, len(df) if df is not None else 0))
         return df
 
-    async def _base_save(self, *, attr, coll, data: pd.DataFrame) -> List[str]:
+    async def _base_save(self, *, attr: str, coll: str, data: Union[pd.DataFrame, List[Dict]]) -> List[str]:
+        """内部函数，不用管
+
+        Args:
+            attr (str): 原始是修饰器传的值
+            coll (str): 原始是修饰器解析出来的表
+            data (Union[pd.DataFrame, List[Dict]]): 数据
+
+        Returns:
+            List[str]: 保存的id
+
         """
-        :param data: DataFrame 同tab
-        :return: list[_id]
-        """
-        count = data.shape[0] if data is not None else 0
+        count = len(data) if data is not None else 0
+
         inserted_ids = []
         self.log.debug('保存: {}, count = {} ...'.format(attr, count))
         if count > 0:
@@ -103,22 +122,37 @@ class MongoDB():
 
         return inserted_ids
 
-    def init(self) -> bool:
+    def init(self, *, retry_init=False) -> bool:
+        """初始化
+
+        Args:
+            retry_init (bool, optional): 是否异常重试的init False.
+
+        Raises:
+            e: 无法连接数据库
+
+        Returns:
+            bool: 成功或失败
+        """
+        if retry_init:
+            self.is_init = False
+
         if self.is_init:
             return True
 
-        if len(self.meta) == 0 or len(self.db) == 0:
-            return False
+        # if len(self.meta) == 0 or len(self.db) == 0:
+        #     return False
         try:
             for _ in range(self.pool):
                 client = motor.motor_asyncio.AsyncIOMotorClient(self.uri)
                 self.clients.append(self._MongoStat(
                     client=client, count=0, last=time.time()))
 
-            test_coll = self.get_coll(self.db, list(self.meta.keys())[0])
-            if test_coll is not None:
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(test_coll.count_documents({}))
+            # if len(self.meta) != 0 and len(self.db) != 0:
+            #     test_coll = self._get_coll(self.db, list(self.meta.keys())[0])
+            #     if test_coll is not None:
+            #         loop = asyncio.get_event_loop()
+            #         loop.run_until_complete(test_coll.count_documents({}))
         except Exception as e:
             self.log.error(type(e))
             raise e
@@ -130,13 +164,29 @@ class MongoDB():
     def get_client(self, **kwargs):
         return kwargs['__client'] if '__client' in kwargs else None
 
-    def get_coll(self, db: str, col: str):
+    def _get_coll(self, db: str, col: str):
         client = self.get_client()
         if client is None:
             return None
         return client[db][col]
 
-    async def do_load(self, coll, filter=None, projection=None, skip=0, limit=0, sort=None, to_frame=True):
+    async def do_load(self, *, coll: str, filter: str = None, projection: Optional[List[str]] = None,
+                      skip: int = 0, limit: int = 0, sort: Optional[List[Dict]] = None,
+                      to_frame: bool = True) -> Optional[Union[pd.DataFrame, Dict]]:
+        """查询数据库
+
+        Args:
+            coll (str): 数据库表
+            filter (str, optional): 同pymongo参数， 默认 None.
+            projection (Optional[List[str]], optional): 同pymongo参数， 默认 None.
+            skip (int, optional): 同pymongo参数， 默认 0.
+            limit (int, optional): 同pymongo参数， 默认 0.
+            sort (Optional[List[Dict]], optional): 同pymongo参数， 默认 None.
+            to_frame (bool, optional): 同pymongo参数， 默认 True.
+
+        Returns:
+            Optional[pd.DataFrame]: DataFrame/Dict
+        """
         for i in range(5):
             try:
                 cursor = coll.find(
@@ -161,10 +211,22 @@ class MongoDB():
                 self.log.error('mongodb 调用 {}, 连接异常: ex={}, call {}, {}s后重试'.format(
                     self.do_load.__name__, e, traceback.format_exc(), (i + 1) * 5))
                 await asyncio.sleep((i + 1) * 5)
-                self.init()
+                self.init(retry_init=True)
         return None
 
-    async def do_update(self, coll, filter=None, update=None, upsert=True):
+    async def do_update(self, *, coll: str, filter: Optional[Dict] = None,
+                        update: Optional[Dict] = None, upsert: bool = True) -> int:
+        """更新单条数据
+
+        Args:
+            coll (str): 数据库表
+            filter (str, optional): 同pymongo参数， 默认 None.
+            update (Optional[Dict], optional): 更新的数据，默认 None.
+            upsert (bool, optional): 不存在是否插入，默认 True.
+
+        Returns:
+            int: 更新条数
+        """
         for i in range(5):
             try:
                 if update is None:
@@ -177,10 +239,22 @@ class MongoDB():
                 self.log.error('mongodb 调用 {}, 连接异常: ex={}, call {}, {}s后重试'.format(
                     self.do_update.__name__, e, traceback.format_exc(), (i + 1) * 5))
                 await asyncio.sleep((i + 1) * 5)
-                self.init()
+                self.init(retry_init=True)
         return 0
 
-    async def do_update_many(self, coll, filter=None, update=None, upsert=True):
+    async def do_update_many(self, coll: str, filter: Optional[Dict] = None,
+                             update: Optional[Dict] = None, upsert: bool = True) -> int:
+        """更新多条数据
+
+        Args:
+            coll (str): 数据库表
+            filter (str, optional): 同pymongo参数， 默认 None.
+            update (Optional[Dict], optional): 更新的数据，默认 None.
+            upsert (bool, optional): 不存在是否插入，默认 True.
+
+        Returns:
+            int: 更新条数
+        """
         for i in range(5):
             try:
                 if update is None:
@@ -193,14 +267,25 @@ class MongoDB():
                 self.log.error('mongodb 调用 {}, 连接异常: ex={}, call {}, {}s后重试'.format(
                     self.do_update.__name__, e, traceback.format_exc(), (i + 1) * 5))
                 await asyncio.sleep((i + 1) * 5)
-                self.init()
+                self.init(retry_init=True)
         return 0
 
-    async def do_batch_update(self, data, func):
+    async def do_batch_update(self, data: Union[pd.DataFrame, List[Dict]], func: Callable) -> int:
+        """批量更新
+
+        Args:
+            data (Union[pd.DataFrame, List[Dict]]): 更新的数据
+            func (function): 单条记录更新的条件
+
+        Returns:
+            int: 更新条数
+        """
         upsert_list = []
-        for item in data.to_dict('records'):
+        data = data.to_dict('records') if isinstance(
+            data, pd.DataFrame) else data
+        for item in data:
             coll, filter, update = func(item)
-            upsert = await self.do_update(coll, filter=filter, update=update)
+            upsert = await self.do_update(coll=coll, filter=filter, update=update)
             if upsert is None:
                 continue
             if isinstance(upsert, list):
@@ -209,7 +294,17 @@ class MongoDB():
                 upsert_list.append(upsert)
         return upsert_list if len(upsert_list) > 0 else None
 
-    async def do_delete(self, coll, filter=None, just_one=True):
+    async def do_delete(self, coll: str, filter: Optional[Dict] = None, just_one: bool = True) -> int:
+        """删除记录
+
+        Args:
+            coll (str): 数据库表
+            filter (str, optional): 同pymongo参数， 默认 None.
+            just_one (bool, optional): 是否只删除一条 True.
+
+        Returns:
+            int: 删除的条数
+        """
         for i in range(5):
             try:
                 res = None
@@ -225,21 +320,31 @@ class MongoDB():
                 self.log.error('mongodb 调用 {}, 连接异常: ex={}, call {}, {}s后重试').format(
                     self.do_delete.__name__, e, traceback.format_exc(), (i + 1) * 5)
                 await asyncio.sleep((i + 1) * 5)
-                self.init()
+                self.init(retry_init=True)
         return 0
 
-    async def do_insert(self, coll, data):
+    async def do_insert(self, *, coll: str, data: Union[pd.DataFrame, List[Dict]]) -> int:
+        """插入数据
+
+        Args:
+            coll (str): 数据表
+            data (Union[pd.DataFrame, List[Dict]]): 数据
+
+        Returns:
+            int: 插入的条数
+        """
         for i in range(5):
             try:
                 inserted_ids = []
-                if data is not None and not data.empty:
-                    docs = data.to_dict('records')
-                    result = await coll.insert_many(docs)
+                data = data.to_dict('records') if isinstance(
+                    data, pd.DataFrame) else data
+                if data is not None:
+                    result = await coll.insert_many(data)
                     inserted_ids = result.inserted_ids
-                return inserted_ids
+                return len(inserted_ids)
             except (ServerSelectionTimeoutError, AutoReconnect) as e:
                 self.log.error('mongodb 调用 {}, 连接异常: ex={}, call {}, {}s后重试').format(
                     self.do_insert.__name__, e, traceback.format_exc(), (i + 1) * 5)
                 await asyncio.sleep((i + 1) * 5)
-                self.init()
+                self.init(retry_init=True)
         return 0
